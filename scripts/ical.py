@@ -26,6 +26,7 @@ import urllib.error
 import urllib.parse
 import base64
 import re
+import dbus
 from datetime import datetime, date, timedelta, timezone
 from pathlib import Path
 
@@ -63,59 +64,39 @@ KNOWN_IMPORTANT_PEOPLE = [
 ]
 
 # ── Keyring ────────────────────────────────────────────────────────────────────
+# Uses D-Bus directly — secret-tool lookup/search is broken on this system.
 
 def get_credentials():
     """Retrieve iCloud credentials from GNOME Keyring."""
     try:
-        # Get password via lookup (uses all attributes as a filter)
-        result = subprocess.run(
-            ["secret-tool", "lookup", "application", KEYRING_APP, "service", KEYRING_SERVICE],
-            capture_output=True, text=True, timeout=5
+        bus = dbus.SessionBus()
+        svc = dbus.Interface(
+            bus.get_object('org.freedesktop.secrets', '/org/freedesktop/secrets'),
+            'org.freedesktop.Secret.Service',
         )
-        if result.returncode != 0 or not result.stdout.strip():
+        _, session = svc.OpenSession('plain', dbus.String('', variant_level=1))
+        unlocked, locked = svc.SearchItems(
+            {'application': KEYRING_APP, 'service': KEYRING_SERVICE}
+        )
+        items = list(unlocked) + list(locked)
+        if not items:
             print("ERROR: iCloud credentials not found in keyring.", file=sys.stderr)
             print("Run: secret-tool store --label='iCloud CalDAV' application dae service ical username your@icloud.com", file=sys.stderr)
             sys.exit(1)
-
-        password = result.stdout.strip()
-
-        # Get username — secret-tool search output format varies by distro.
-        # Try both known formats: 'attribute.username = X' and 'username = X'
-        result2 = subprocess.run(
-            ["secret-tool", "search", "--all", "--unlock",
-             "application", KEYRING_APP, "service", KEYRING_SERVICE],
-            capture_output=True, text=True, timeout=5
-        )
-        username = None
-        for line in result2.stdout.splitlines() + result2.stderr.splitlines():
-            line = line.strip()
-            # Match: 'attribute.username = foo' or 'username = foo'
-            m = re.match(r"(?:attribute\.)?username\s*=\s*(.+)", line, re.IGNORECASE)
-            if m:
-                username = m.group(1).strip()
-                break
-
-        # Fallback: try lookup with username attribute directly
-        if not username:
-            result3 = subprocess.run(
-                ["secret-tool", "search", "application", KEYRING_APP, "service", KEYRING_SERVICE],
-                capture_output=True, text=True, timeout=5
-            )
-            for line in result3.stdout.splitlines() + result3.stderr.splitlines():
-                line = line.strip()
-                m = re.match(r"(?:attribute\.)?username\s*=\s*(.+)", line, re.IGNORECASE)
-                if m:
-                    username = m.group(1).strip()
-                    break
-
+        item = bus.get_object('org.freedesktop.secrets', items[0])
+        attrs = dict(dbus.Interface(item, 'org.freedesktop.DBus.Properties')
+                     .Get('org.freedesktop.Secret.Item', 'Attributes'))
+        username = str(attrs.get('username', ''))
         if not username:
             print("ERROR: Username not found in keyring entry.", file=sys.stderr)
-            print("Debug output:", file=sys.stderr)
-            print(result2.stdout[:500], file=sys.stderr)
             print("Re-run: secret-tool store --label='iCloud CalDAV' application dae service ical username your@icloud.com", file=sys.stderr)
             sys.exit(1)
-
+        secret = dbus.Interface(item, 'org.freedesktop.Secret.Item').GetSecret(session)
+        password = bytes(secret[2]).decode('utf-8')
         return username, password
+    except dbus.DBusException as e:
+        print(f"ERROR: Keyring access failed: {e}", file=sys.stderr)
+        sys.exit(1)
 
     except FileNotFoundError:
         print("ERROR: secret-tool not found. Install: sudo apt install libsecret-tools", file=sys.stderr)
